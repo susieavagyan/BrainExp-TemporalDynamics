@@ -1,0 +1,1228 @@
+---
+title: "brain_expression_temporal_dynamics"
+output: html_document
+date: '2022-05-06'
+---
+
+# **Temporal changes of gene expression in health and mental disorders**
+
+#### Abstract:
+Schizophrenia (SCZ), bipolar disorder (BD), and major depressive disorder (MDD), are complex and heterogeneous conditions thought to arise from an interplay of diverse genetic and environmental factors. The molecular events contributing to disease development, manifestation, and course are known to be distributed through embryonic life to the elderly. However, due to the age of onset, clinical samples are always thresholded to relatively older age, and little is known about early dynamics in gene expression in these diseases. 
+We performed a secondary analysis of microarray datasets of post-mortem prefrontal cortex of control brains and patients with SCZ, BD, and MDD available in Gene Expression Omnibus and the Stanley Medical Research Institute Online Genomics Database․ We used self-organized maps machine learning (oposSOM package) to dissect brain transcriptome into functional gene modules associated with aging and diseases and Gaussian Process Regression (DE_time package) to detect time-perturbation points of disease-associated functional points characteristics to mental disorders. Finally, we performed eQTL enrichment of genes in time-perturbed functional modules. Our results indicate that mental disorders are characterized by early, mid, and late deregulation of identified functional spots. The results align with the hypothesis that two or more 'hits' are required over the lifespan rather than only one early-life event for disease manifestation. Time-perturbed functional spots were enriched with eQTL genes implicating the contribution of genetic components in the gene expression dynamics and development of the disease phenotype.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning = FALSE)  #eliminate code, warnings and messages in the knitted markdown, keep all results of chunks (text and plots)
+```
+
+**Loading needed libraries**
+
+```{r}
+library(sva)
+library(RColorBrewer)
+library(dplyr)
+library(Matrix)
+library(AtmRay) 
+library(spam)
+library(gptk)
+library(DEtime) 
+library(enrichR)
+library(limma)
+library(venn)
+library(networkD3)
+library(DOSE)
+library(org.Hs.eg.db)
+library(here)
+library(inborutils)
+library(utils)
+library(oposSOM)
+```
+
+```{r}
+##initiate the working directory to be the dir of the running file
+here()
+```
+
+## **Downloading and Extracting Data from Zenodo**
+
+```{r}
+##skip if data has been downloaded
+download_zenodo('10.5281/zenodo.7936218') #takes around 2 hours
+unzip("./Data.zip", exdir = "./Data")
+```
+
+**Function to read pheno data**
+
+```{r}
+load_pheno <-  function(where = "Data/pheno/", batch) {
+    ##reading pheno data
+  phenos.full <- dir(where, pattern = "pheno.csv", full.names = T)
+  phenos <- dir(where, pattern = "pheno.csv")
+  pheno.names <- sapply(phenos, function(x) strsplit(x,split = ".", fixed = T )[[1]][1])
+  names(pheno.names) <- NULL
+  
+  pheno.list <- list()
+  for(i in 1:length(phenos.full)) {
+    pheno.list[[i]] <- read.csv(file <- phenos.full[[i]], header = T, row.names = 1)
+  }
+  
+  
+  age <- vector(mode = "numeric", length = length(batch))
+  sex <- vector(mode = "character", length = length(batch))
+  ph  <- vector(mode = "numeric", length = length(batch))
+  pmi <- vector(mode = "numeric", length = length(batch))
+  
+  
+  names(age) <- names(sex) <- names(ph) <- names(pmi) <- names(batch)
+  
+  for(i in 1:length(pheno.list)){
+    samples.tmp <- intersect(rownames(pheno.list[[i]]), names(batch))
+    age[samples.tmp] <- pheno.list[[i]][samples.tmp, "age"]
+    sex[samples.tmp] <- pheno.list[[i]][samples.tmp, "sex"]  
+    ph[samples.tmp] <- as.numeric(pheno.list[[i]][samples.tmp, "ph"])
+    pmi[samples.tmp] <- as.numeric(pheno.list[[i]][samples.tmp, "pmi"])
+  }
+  
+  return(list(age, sex, ph, pmi))
+}
+```
+
+# **PCA and Batch Effects Analysis** 
+
+-   Loading data and removing batch effects of covariates
+
+```{r}
+load("Data/Brain_development_v3.Rdata")
+
+dat <- do.call(cbind, indata.list)
+batch <- rep(1:length(group.labels.list), times = sapply(group.labels.list, length))
+
+group.labels <- do.call(c, group.labels.list) 
+group.label.names <- sapply(names(group.labels), function(x) strsplit(x, split = ".", fixed = T)[[1]][2])
+names(group.label.names) <- NULL
+names(group.labels) <- group.label.names
+names(batch) <- names(group.labels)
+
+##loading phenotype data
+pheno_vars <- load_pheno(where="Data/pheno",batch)
+age <- pheno_vars[[1]]
+sex <- pheno_vars[[2]]
+ph <- pheno_vars[[1]]
+pmi <- pheno_vars[[1]]
+
+pmi[is.na(pmi)] <- mean(pmi, na.rm = T)
+ph[is.na(ph)] <- mean(ph, na.rm = T)
+
+dat <- dat - rowMeans(dat)
+mod <- model.matrix(~0+as.factor(group.labels))
+
+##removing batch effects
+datn <- removeBatchEffect(dat, batch = batch, batch2 = sex, covariates = cbind(ph, pmi), design = mod)
+
+col.pal.batch <- RColorBrewer::brewer.pal(n = length(unique(batch)), name = "Accent")
+c.ind <- grep("Cntrl", group.labels) 
+s.ind <- grep("Scz", group.labels) 
+b.ind <- grep("BP", group.labels) 
+m.ind <- grep("MDD", group.labels)
+
+condition <- rep(1, times=length(group.labels))
+condition[s.ind] <- 2
+condition[b.ind] <- 3
+condition[m.ind] <- 4
+
+col.pal.cond <- RColorBrewer::brewer.pal(n = length(unique(condition)), name = "Dark2")
+col.batch <- col.pal.batch[batch]
+col.cond <- col.pal.cond[condition]
+
+
+p <- try(prcomp(dat), silent = T)
+pn <- try(prcomp(datn), silent = T)
+
+if(class(p)!="try-error") {
+  {
+    plot(p$rotation, col = col.batch, main = "before batch adjustment by batch")
+    legend("topright", legend=unique(batch),
+           col=col.pal.batch, pch = 1, cex=0.8)
+  }
+}
+
+if(class(p)!="try-error") {
+  {
+    plot(p$rotation, col = col.cond, main = "before batch adjustment by condition")
+    legend("topright", legend=unique(condition),
+           col=col.pal.cond, pch = 1, cex=0.8)
+  }
+}
+
+if(class(pn)!="try-error") {
+  {
+    plot(pn$rotation, col = col.batch, main = "after batch adjustment by batch")
+    legend("topright", legend=unique(batch),
+           col=col.pal.batch, pch = 1, cex=0.8)
+  }
+}
+
+if(class(pn)!="try-error") {
+  {
+    plot(pn$rotation, col = col.cond, main = "after batch adjustment by condition")
+    legend("topright", legend=unique(condition),
+           col=col.pal.cond, pch = 1, cex=0.8)
+  }
+}
+
+```
+
+-   PCA for Control samples
+
+```{r}
+cntrl.ind <- grep("Cntrl", group.labels)
+cntrl.dat <- dat[, cntrl.ind]
+cntrl.datn <- datn[, cntrl.ind]
+cntrl.batch <- batch[cntrl.ind]
+delta <- min(cntrl.batch)-1
+cntrl.batch.n <- cntrl.batch-delta 
+cntrl.lbl <- group.labels[cntrl.ind]
+
+ord <- unique(cntrl.lbl)[c(1,2,3,4,5,6,8,7,9)]
+ind <- NULL
+for(i in ord){
+  ind <- c(ind, grep(pattern = i, cntrl.lbl, fixed = T) )
+}
+
+cntrl.ind <- cntrl.ind[ind]
+cntrl.dat <- cntrl.dat[, ind]
+cntrl.datn <- cntrl.datn[, ind]
+cntrl.batch <- cntrl.batch.n[ind]
+cntrl.lbl <- cntrl.lbl[ind] 
+
+# col.pal <- RColorBrewer::brewer.pal(n = length(unique(cntrl.batch.n)), name = "Accent")
+# cols <- col.pal[cntrl.batch.n]
+# 
+# p <- try(prcomp(cntrl.dat-rowMeans(cntrl.dat)), silent = T)
+# if(class(p)!="try-error") {
+#   {
+#     plot(p$rotation, col = cols, main = "before batch adjustment")
+#     legend("topright", legend=unique(cntrl.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+# 
+# pn <- try(prcomp(cntrl.datn), silent = T)
+# if(class(pn)!="try-error") {
+#   {
+#     plot(pn$rotation, col = cols, main = "after batch adjustment")
+#     legend("topright", legend=unique(cntrl.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+
+
+```
+
+-   PCA for Scz samples
+
+```{r}
+
+scz.ind <- grep("Scz", group.labels)
+scz.dat <- dat[, scz.ind]
+scz.datn <- datn[, scz.ind]
+scz.batch <- batch[scz.ind]
+delta <- min(scz.batch)-1
+scz.batch.n <- scz.batch-delta 
+scz.lbl <- group.labels[scz.ind]
+
+o <- order(scz.lbl)
+scz.datn <- scz.datn[, o]
+scz.batch <- scz.batch[o]
+scz.lbl <- scz.lbl[o] 
+# col.pal <- RColorBrewer::brewer.pal(n = length(unique(scz.batch.n)), name = "Accent")
+# cols <- col.pal[scz.batch.n]
+# 
+# 
+# p <- try(prcomp(scz.dat-rowMeans(scz.dat)), silent = T)
+# if(class(p)!="try-error") {
+#   {
+#     plot(p$rotation, col = cols, main = "before batch adjustment")
+#     legend("topright", legend=unique(scz.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+# 
+# pn <- try(prcomp(scz.datn), silent = T)
+# if(class(pn)!="try-error") {
+#   {
+#     plot(pn$rotation, col = cols, main = "after batch adjustment")
+#     legend("topright", legend=unique(scz.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+```
+
+-   PCA for BP samples
+
+```{r}
+bp.ind <- grep("BP", group.labels)
+bp.dat <- dat[, bp.ind]
+bp.datn <- datn[, bp.ind]
+bp.batch <- batch[bp.ind]
+delta <- min(bp.batch)-1
+bp.batch.n <- bp.batch-delta 
+bp.lbl <- group.labels[bp.ind]
+
+o <- order(bp.lbl)
+bp.datn <- bp.datn[, o]
+bp.batch <- bp.batch[o]
+bp.lbl <- bp.lbl[o] # col.pal <- RColorBrewer::brewer.pal(n = length(unique(bp.batch.n)), name = "Accent")
+# cols <- col.pal[bp.batch.n]
+# 
+# 
+# p <- try(prcomp(bp.dat-rowMeans(bp.dat)), silent = T)
+# if(class(p)!="try-error") {
+#   {
+#     plot(p$rotation, col = cols, main = "before batch adjustment")
+#     legend("topright", legend=unique(bp.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+# 
+# pn <- try(prcomp(bp.datn), silent = T)
+# if(class(pn)!="try-error") {
+#   {
+#     plot(pn$rotation, col = cols, main = "after batch adjustment")
+#     legend("topright", legend=unique(bp.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+```
+
+-   PCA for MDD samples
+
+```{r}
+mdd.ind <- grep("MDD", group.labels)
+mdd.dat <- dat[, mdd.ind]
+mdd.datn <- datn[, mdd.ind]
+mdd.batch <- batch[mdd.ind]
+delta <- min(mdd.batch)-1
+mdd.batch.n <- mdd.batch-delta 
+mdd.lbl <- group.labels[mdd.ind]
+
+o <- order(mdd.lbl)
+mdd.datn <- mdd.datn[, o]
+mdd.batch <- mdd.batch[o]
+mdd.lbl <- mdd.lbl[o]
+# col.pal <- RColorBrewer::brewer.pal(n = length(unique(mdd.batch.n)), name = "Accent")
+# cols <- col.pal[mdd.batch.n]
+# 
+# 
+# p <- try(prcomp(mdd.dat-rowMeans(mdd.dat)), silent = T)
+# if(class(p)!="try-error") {
+#   {
+#     plot(p$rotation, col = cols, main = "before batch adjustment")
+#     legend("topright", legend=unique(mdd.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+# 
+# pn <- try(prcomp(mdd.datn), silent = T)
+# if(class(pn)!="try-error") {
+#   {
+#     plot(pn$rotation, col = cols, main = "after batch adjustment")
+#     legend("topright", legend=unique(mdd.batch.n),
+#            col=col.pal, pch = 1, cex=0.8)
+#   }
+# }
+```
+
+-   Combine data and save
+
+```{r}
+indata <- cbind(cntrl.datn, scz.datn, bp.datn, mdd.datn)
+group.labels <- c(cntrl.lbl, scz.lbl, bp.lbl, mdd.lbl)
+batch <- c(cntrl.batch, scz.batch, bp.batch, mdd.batch)
+# save(list = c("indata", "group.labels", "batch"), file = "som_input_v5.Rdata")
+```
+
+# **SOM training and results**
+
+```{r}
+## run this chunk if need to regenerate SOM results from preprocessed data
+##source("script_SOM_v5.R")
+```
+
+**Loading SOM results and combining spots**
+
+```{r, include=FALSE}
+##loading SOM result
+load("Data/v5_results.SOM - Results/v5_results.SOM.RData")
+
+# combined spots
+env$spot.list.GSZ.scores$spotdata <- env$samples.GSZ.scores
+
+km.spot <- c("W", "S", "G", "U", "B", "I")
+ov.spot <- c("U", "Q", "G", "A")
+gr.spot <- c("K", "I")
+dm.spot <- c("V1", "J1", "E1", "J", "P", "S")
+
+names_km.spot <- paste0("KM_", c("W", "S", "G", "U", "B", "I"))
+names_ov.spot <- paste0("OV_", c("U", "Q", "G", "A"))
+names_gr.spot <- paste0("GR_", c("K", "I"))
+names_dm.spot <- paste0("DM_", c("V1", "J1", "E1", "J", "P", "S"))
+
+spot.list <- list()
+spot.list$spots <- c(env$spot.list.kmeans$spots[km.spot],
+                     env$spot.list.overexpression$spots[ov.spot],
+                     env$spot.list.group.overexpression$spots[gr.spot],
+                     env$spot.list.dmap$spots[dm.spot])
+names(spot.list$spots) <- c(names_km.spot, names_ov.spot, names_gr.spot, names_dm.spot)
+
+spot.list$spotdata <- rbind(env$spot.list.kmeans$spotdata[km.spot, ],
+                            env$spot.list.overexpression$spotdata[ov.spot, ],
+                            env$spot.list.group.overexpression$spotdata[gr.spot, ],
+                            env$spot.list.dmap$spotdata[dm.spot, ])
+
+rownames(spot.list$spotdata) <-  c(names_km.spot, names_ov.spot, names_gr.spot, names_dm.spot)
+
+spot.list$overview.map <-  apply(apply(env$metadata, 2, function(x) { (x - min(x)) / (max(x) - min(x)) }), 1, max)
+
+overview.mask <- rep(NA, times = env$preferences$dim.1stLvlSom^2)
+
+for(i in 1:length(rownames(spot.list$spotdata)) ) {
+  
+  spot.type <- rownames(spot.list$spotdata)[i]
+  spot.type <- strsplit(spot.type, split = "_", fixed = TRUE)
+  
+  if(spot.type[[1]][1]=="KM") {
+    ind.orig.spot <- which(names(env$spot.list.kmeans$spots)==spot.type[[1]][2])
+    ind.map <- which(env$spot.list.kmeans$overview.mask==ind.orig.spot)
+    overview.mask[ind.map] <- i
+  } else if (spot.type[[1]][1]=="OV") {
+    ind.orig.spot <- which(names(env$spot.list.overexpression$spots)==spot.type[[1]][2])
+    ind.map <- which(env$spot.list.overexpression$overview.mask==ind.orig.spot)
+    overview.mask[ind.map] <- i
+  } else if (spot.type[[1]][1]=="GR") {
+    ind.orig.spot <- which(names(env$spot.list.group.overexpression$spots)==spot.type[[1]][2])
+    ind.map <- which(env$spot.list.group.overexpression$overview.mask==ind.orig.spot)
+    overview.mask[ind.map] <- i
+  } else if (spot.type[[1]][1]=="DM") {
+    ind.orig.spot <- which(names(env$spot.list.dmap$spots)==spot.type[[1]][2])
+    ind.map <- which(env$spot.list.dmap$overview.mask==ind.orig.spot)
+    overview.mask[ind.map] <- i
+  }
+} 
+
+spot.list$overview.mask <- overview.mask
+
+names(spot.list$spots) <- LETTERS[1:length(names(spot.list$spots))]
+rownames(spot.list$spotdata) <- LETTERS[1:length(names(spot.list$spots))]
+
+
+dir.name <- "combined.spots"
+
+if(!dir.exists(dir.name)) {
+  dir.create(dir.name)
+}
+```
+
+# **Differentially expressed genes across age groups in studied diseases**
+
+```{r}
+
+gene.files <- dir("Data/v5_results.SOM - Results/Summary Sheets - Differences/CSV Sheets/Gene Lists - Global/", full.names = T)
+gene.files.names <- dir("Data/v5_results.SOM - Results/Summary Sheets - Differences/CSV Sheets/Gene Lists - Global/")
+gene.files.names <- sapply(gene.files.names, function(x) strsplit(x, split=".", fixed=T)[[1]][1])
+names(gene.files.names) <- NULL
+diff.gene.list <- vector(mode = "list", length = length(gene.files.names))
+for(i in 1:length(diff.gene.list)){
+  dat <- read.csv(file=gene.files[i],
+                  header = T, skip=16)
+  fdr <- sapply(dat$fdr, function(x) strsplit(x, split = " ", fixed = T)[[1]][1])
+  names(fdr) <- NULL
+  fdr <- as.numeric(fdr)
+  diff.gene.list[[i]] <- list(up=unique(dat$Symbol[dat$logFC>0 & fdr < 0.05]),
+                              down=unique(dat$Symbol[dat$logFC<0 & fdr < 0.05]) )
+}
+names(diff.gene.list) <- gene.files.names
+
+
+gs.files <- dir("Data/v5_results.SOM - Results/Summary Sheets - Differences/CSV Sheets/Gene Set Lists - Global/", full.names = T)
+gs.files.names <- dir("Data/v5_results.SOM - Results/Summary Sheets - Differences/CSV Sheets/Gene Set Lists - Global/")
+gs.files.names <- sapply(gs.files.names, function(x) strsplit(x, split=".", fixed=T)[[1]][1])
+names(gs.files.names) <- NULL
+
+diff.gs.list <- vector(mode = "list", length = length(gene.files.names))
+for(i in 1:length(diff.gs.list)){
+  dat <- read.csv(file=gs.files[i],
+                  header = T)
+  fdr.u <- sapply(dat$fdr, function(x) strsplit(x, split = " ", fixed = T)[[1]][1])
+  names(fdr.u) <- NULL
+  fdr.u <- as.numeric(fdr.u)
+  fdr.d <- sapply(dat$fdr., function(x) strsplit(x, split = " ", fixed = T)[[1]][1])
+  names(fdr.d) <- NULL
+  fdr.d <- as.numeric(fdr.d)
+  diff.gs.list[[i]] <- list(up=dat$Upregulated[dat$GSZ > 3 & fdr.u<0.05], down=dat$Downregulated[dat$GSZ. < -3 & fdr.d<0.05])
+}
+
+names(diff.gs.list) <- gs.files.names
+gs.up <- sapply(diff.gs.list, function(x) length(x$up))
+gs.down <- sapply(diff.gs.list, function(x) length(x$down))
+genes.up <- sapply(diff.gene.list, function(x) length(x$up))
+genes.down <- sapply(diff.gene.list, function(x) length(x$down))
+par(mar=c(10,10,5,5))
+genes.mat <- rbind(genes.up, genes.down)
+barplot(genes.mat[,1:4], col=c("red", "blue"), las=3)
+barplot(genes.mat[,5:7], col=c("red", "blue"), las=3)
+barplot(genes.mat[,8:12], col=c("red", "blue"),las=3)
+gs.mat <- rbind(gs.up, gs.down)
+barplot(gs.mat[,1:4], col=c("red", "blue"), las=3)
+barplot(gs.mat[,5:7], col=c("red", "blue"), las=3)
+barplot(gs.mat[,8:12], col=c("red", "blue"), las=3)
+
+```
+
+
+# **scRNA-seq data and spot correlation**
+
+### **scRNA cell marker gene signatures and spot correlation**
+
+```{r}
+#scRNA-seq signatures
+load("Data/scRNA-Ruzicka_data/scRNA_cell_markers.Rdata")
+
+scRNA.list = c(scRNA_cell_markers)
+
+# scRNA.list = q$KM_G
+pdf(file = paste0(dir.name, "/", "scRNA.cell.mapping.pdf"))
+for(i in 1:length(scRNA.list)) {
+  image(matrix(log10(apply(env$metadata, 1, var)), env$preferences$dim.1stLvlSom,
+               env$preferences$dim.1stLvlSom), axes = FALSE, col = env$color.palette.heatmaps(1000),
+        main = names(scRNA.list)[i], cex.main = 1.5)
+  
+  set.genes <- unique(names(env$gene.info$names)[env$gene.info$names %in% scRNA.list[[i]] ])
+  show(length(set.genes))
+  n.map <- matrix(0, env$preferences$dim.1stLvlSom, env$preferences$dim.1stLvlSom)
+  # n.map <- rep(NA, times=env$preferences$dim.1stLvlSom*env$preferences$dim.1stLvlSom)
+  gs.nodes <- env$som.result$feature.BMU[set.genes]
+  n.map[as.numeric(names(table(gs.nodes)))] <- table(gs.nodes)
+  n.map[which(n.map == 0)] <- NA
+  n.map <- matrix(n.map, env$preferences$dim.1stLvlSom)
+  lim <- c(1, env$preferences$dim.1stLvlSom) + env$preferences$dim.1stLvlSom *
+    0.01 * c(-1, 1)
+  colr <- env$color.palette.heatmaps(1000)[(na.omit(as.vector(n.map)) -
+                                              min(n.map, na.rm = TRUE))/max(1, (max(n.map, na.rm = TRUE) - min(n.map, na.rm = TRUE))) * 999 + 1]
+  par(new=T)
+  plot(which(!is.na(n.map), arr.ind = TRUE), xlim = lim,
+       ylim = lim, pch = 16, axes = FALSE, xlab = "", ylab = "",
+       xaxs = "i", yaxs = "i", col = colr, cex = 0.5 +
+         na.omit(as.vector(n.map))/max(n.map, na.rm = TRUE) *
+         2.8)
+}
+
+dev.off() 
+```
+
+```{r}
+scRNA.gs.def.list <- vector(mode="list", length=length(scRNA.list))
+
+for(i in 1:length(scRNA.gs.def.list)) {
+  ind <- env$gene.info$names %in% scRNA.list[[i]]
+  e.genes <- unique(env$gene.info$ids[ind])
+  scRNA.gs.def.list[[i]]$Genes <- e.genes
+  scRNA.gs.def.list[[i]]$Type <- "scRNA"
+}
+
+names(scRNA.gs.def.list) <- names(scRNA.list)
+
+mean.ex.all <- colMeans( env$indata.ensID.m )
+sd.ex.all <- apply( env$indata.ensID.m, 2, sd )
+
+scRNA.GSZ.scores <- t( sapply( scRNA.gs.def.list, Sample.GSZ, env$indata.ensID.m, mean.ex.all, sd.ex.all ) )
+
+pdf(file = paste0(dir.name, "/", "scRNA.cell.boxplot.pdf")) 
+par(mar=c(10,5,5,5))
+for(i in 1:nrow(scRNA.GSZ.scores))
+  boxplot(scRNA.GSZ.scores[i, ] ~ factor(env$group.labels, levels = unique(env$group.labels)), 
+          col = env$groupwise.group.colors, main = rownames(scRNA.GSZ.scores)[i], border = T, 
+          las=3, xlab = NULL)
+
+dev.off()
+```
+
+```{r}
+
+ind.cor <- list(ind.c = grep("Cntrl_", env$group.labels), 
+                ind.s = grep("Scz_", env$group.labels), 
+                ind.b = grep("BP_", env$group.labels),
+                ind.m = grep("MDD_", env$group.labels))
+group=c("Cntrl", "Scz", "BP", "MDD")
+
+links <- data.frame(matrix(0,ncol = 4, nrow = 0))
+colnames(links) <- c("source", "target", "group", "value")
+
+for(i in 1:length(ind.cor)){
+  x <- rbind(scRNA.GSZ.scores[, ind.cor[[i]]], spot.list$spotdata[,ind.cor[[i]]])
+  y <- cor(t(x))
+  y <- y[rownames(spot.list$spotdata), rownames(scRNA.GSZ.scores)]
+  
+  ind <- which(y>0.7, arr.ind = TRUE)
+  spot_cell <- apply(ind, 1, function(x) colnames(y)[x[2]])
+  spot_cell.cor <- apply(ind,1,function(x) y[x[1], x[2]])
+  links.tmp <- data.frame(source=names(spot_cell), 
+                          target=spot_cell,
+                          group=rep(group[i], times=nrow(ind)),
+                          value=round(1*spot_cell.cor, 2))
+  links <- rbind(links, links.tmp)
+}
+
+nodes.df <- data.frame(names=c(unique(links$source), unique(links$target)))
+nodes.df$group <- as.factor(c("node_group"))
+
+my_color <- 'd3.scaleOrdinal() .domain(["Cntrl", "Scz", "BP", "MDD","node_group"]) .range(["#EFF3FF", "#BDD7E7", "#6BAED6", "#2171B5", "grey"])'
+
+links$IDsource <- match(links$source, nodes.df$names)-1
+links$IDtarget <- match(links$target, nodes.df$names)-1
+
+p <- sankeyNetwork(Links = links, Nodes = nodes.df, 
+                   Source = "IDsource", Target = "IDtarget", sinksRight = FALSE,
+                   Value = "value", NodeID = "names", fontSize = 12,
+                   colourScale=my_color, LinkGroup="group", NodeGroup="group")
+
+write.csv(links, file="combined.spots/Links.Cell.Populations.csv")
+```
+### **scRNA neuroprocesses gene signatures and spot correlation**
+
+```{r}
+#scRNA-seq genelists
+load("Data/scRNA-Ruzicka_data/scRNA_GS_list.Rdata")
+scRNA.list = c(scRNA_GS_list)
+
+# scRNA.list = q$KM_G
+# pdf(file = paste0(dir.name, "/", "scRNA.proc.mapping.pdf"))
+# for(i in 1:length(scRNA.list)) {
+#   image(matrix(log10(apply(env$metadata, 1, var)), env$preferences$dim.1stLvlSom,
+#                env$preferences$dim.1stLvlSom), axes = FALSE, col = env$color.palette.heatmaps(1000),
+#         main = names(scRNA.list)[i], cex.main = 1.5)
+#   
+#   set.genes <- unique(names(env$gene.info$names)[env$gene.info$names %in% scRNA.list[[i]] ])
+#   show(length(set.genes))
+#   n.map <- matrix(0, env$preferences$dim.1stLvlSom, env$preferences$dim.1stLvlSom)
+#   # n.map <- rep(NA, times=env$preferences$dim.1stLvlSom*env$preferences$dim.1stLvlSom)
+#   gs.nodes <- env$som.result$feature.BMU[set.genes]
+#   n.map[as.numeric(names(table(gs.nodes)))] <- table(gs.nodes)
+#   n.map[which(n.map == 0)] <- NA
+#   n.map <- matrix(n.map, env$preferences$dim.1stLvlSom)
+#   lim <- c(1, env$preferences$dim.1stLvlSom) + env$preferences$dim.1stLvlSom *
+#     0.01 * c(-1, 1)
+#   colr <- env$color.palette.heatmaps(1000)[(na.omit(as.vector(n.map)) -
+#                                               min(n.map, na.rm = TRUE))/max(1, (max(n.map, na.rm = TRUE) - min(n.map, na.rm = TRUE))) * 999 + 1]
+#   par(new=T)
+#   plot(which(!is.na(n.map), arr.ind = TRUE), xlim = lim,
+#        ylim = lim, pch = 16, axes = FALSE, xlab = "", ylab = "",
+#        xaxs = "i", yaxs = "i", col = colr, cex = 0.5 +
+#          na.omit(as.vector(n.map))/max(n.map, na.rm = TRUE) *
+#          2.8)
+# }
+# dev.off()
+
+scRNA.gs.def.list <- vector(mode="list", length=length(scRNA.list))
+
+for(i in 1:length(scRNA.gs.def.list)) {
+  ind <- env$gene.info$names %in% scRNA.list[[i]]
+  e.genes <- unique(env$gene.info$ids[ind])
+  scRNA.gs.def.list[[i]]$Genes <- e.genes
+  scRNA.gs.def.list[[i]]$Type <- "scRNA"
+}
+
+names(scRNA.gs.def.list) <- names(scRNA.list)
+
+mean.ex.all <- colMeans( env$indata.ensID.m )
+sd.ex.all <- apply( env$indata.ensID.m, 2, sd )
+
+scRNA.GSZ.scores <- t( sapply( scRNA.gs.def.list, Sample.GSZ, env$indata.ensID.m, mean.ex.all, sd.ex.all ) )
+
+pdf(file = paste0(dir.name, "/", "scRNA.proc.boxplot.pdf"))
+# par(mfrow = c(4,5))
+par(mar=c(10,5,5,5))
+for(i in 1:nrow(scRNA.GSZ.scores))
+  boxplot(scRNA.GSZ.scores[i, ] ~ factor(env$group.labels, levels = unique(env$group.labels)), 
+          col = env$groupwise.group.colors, main = rownames(scRNA.GSZ.scores)[i], border = T, 
+          las=3, xlab = NULL)
+
+dev.off()
+```
+
+```{r}
+pdf(file = paste0(dir.name, "/", "scRNA.proc.correlation.pdf")) 
+
+ind.cor <- list(ind.c = grep("Cntrl_", env$group.labels), 
+                ind.s = grep("Scz_", env$group.labels), 
+                ind.b = grep("BP_", env$group.labels),
+                ind.m = grep("MDD_", env$group.labels))
+
+y.list = list()
+
+for(i in 1:length(ind.cor)){
+  x <- rbind(scRNA.GSZ.scores[, ind.cor[[i]]], spot.list$spotdata[,ind.cor[[i]]])
+  y <- cor(t(x))
+  y <- y[rownames(spot.list$spotdata), rownames(scRNA.GSZ.scores)]
+  y.list[[i]] <- y
+  
+  # gp <- gplots::heatmap.2(y, trace = "none", col = env$color.palette.heatmaps(1000),
+  #                   Colv = "Rowv", 
+  #                   scale = "none", dendrogram = "both", cexCol = 0.75, margins = c(9,5))
+  }
+
+names(y.list) <- c("Control", "SCZ", "BP", "MDD")
+dev.off()
+```
+
+```{r}
+comparison.list = list(
+  samplesC18_35=list(C18_35=names(env$group.labels)[env$group.labels=="Cntrl_(18-35]"], 
+                     S18_35=names(env$group.labels)[env$group.labels=="Scz_(18-35]"],
+                     B18_35=names(env$group.labels)[env$group.labels=="BP_(18-35]"], 
+                     M18_35=names(env$group.labels)[env$group.labels=="MDD_(18-35]"]),
+  
+  samplesC35_50=list(C35_50=names(env$group.labels)[env$group.labels=="Cntrl_(35-50]"], 
+                     S35_50=names(env$group.labels)[env$group.labels=="Scz_(35-50]"],
+                     B35_50=names(env$group.labels)[env$group.labels=="BP_(35-50]"],
+                     M35_50=names(env$group.labels)[env$group.labels=="MDD_(35-50]"]),
+  
+  samplesC50_65=list(C50_65=names(env$group.labels)[env$group.labels=="Cntrl_(50-65]"], 
+                     S50_65=names(env$group.labels)[env$group.labels=="Scz_(50-65]"],
+                     B50_65=names(env$group.labels)[env$group.labels=="BP_(50-65]"],
+                     M50_65=names(env$group.labels)[env$group.labels=="MDD_(50-65]"]),
+  
+  samplesC65_85=list(C65_85=names(env$group.labels)[env$group.labels=="Cntrl_(65-85]"],
+                     S65_85=names(env$group.labels)[env$group.labels=="Scz_(65-85]"],
+                     B65_85=names(env$group.labels)[env$group.labels=="BP_(65-85]"],
+                     M65_85=names(env$group.labels)[env$group.labels=="MDD_(65-85]"]),
+  samplesC85_100=list(C85_100=names(env$group.labels)[env$group.labels=="Cntrl_(85-100]"], 
+                      S85_100=names(env$group.labels)[env$group.labels=="Scz_(85-100]"])
+)
+
+
+pdf(file = "combined.spots/spot_boxplots_by_group.pdf")
+# par(mfrow = c(4,5))
+par(mar=c(10,5,5,5))
+
+for(k in 1:length(comparison.list)){
+  
+  samples <- unlist(comparison.list[[k]])
+  gr <- env$group.labels[samples]
+  cols <- env$group.colors[samples]
+  
+  for(i in 1:nrow(spot.list$spotdata))
+    boxplot(spot.list$spotdata[i, samples] ~ factor(gr, levels = unique(gr)), 
+            col = unique(cols), main = rownames(spot.list$spotdata)[i], 
+            las=3, xlab = NULL)
+}
+dev.off()
+```
+
+## **Temporal signal in spots** 
+
+```{r, echo=FALSE}
+
+cntrl.group.labels = env$group.labels[grep("Cntrl", env$group.labels)]
+cntrl.groupwise.group.colors <- env$groupwise.group.colors[grep("Cntrl", names(env$groupwise.group.colors))]
+cntrl.spotdata <- spot.list$spotdata[, names(cntrl.group.labels)]
+
+sd.threshold = sd(spot.list$spotdata)
+pdf("combined.spots/Control.Spot.Boxplots.pdf")
+layout(matrix(1:8, 4, 2, byrow = TRUE), widths = c(1, 4))
+ylim <- range(unlist(by(t(cntrl.spotdata), cntrl.group.labels, 
+                        range)[unique(cntrl.group.labels)]))
+for (i in 1:length(spot.list$spots)) {
+  par(mar = c(2, 5, 0.5, 1))
+  image(matrix(spot.list$spots[[i]]$mask, env$preferences$dim.1stLvlSom, 
+               env$preferences$dim.1stLvlSom), axes = FALSE, col = "darkgreen")
+  axis(2, 0.95, names(spot.list$spots[i]), las = 2, tick = FALSE, 
+       cex.axis = 1)
+  box()
+  par(mar = c(2, 3, 0.5, 1))
+  boxplot(tapply(cntrl.spotdata[i, ], cntrl.group.labels, 
+                 c)[unique(cntrl.group.labels)], col = cntrl.groupwise.group.colors, 
+          las = 1, ylim = ylim)
+  abline(h = sd.threshold * c(-1, 0, 1), lty = 2, col = "gray")
+  label.string <- rep(".", length(unique(cntrl.group.labels)))
+  label.string[which(tapply(cntrl.spotdata[i, ], cntrl.group.labels, 
+                            mean)[unique(cntrl.group.labels)] > sd.threshold)] = "+"
+  label.string[which(tapply(cntrl.spotdata[i, ], cntrl.group.labels, 
+                            mean)[unique(cntrl.group.labels)] < -sd.threshold)] = "-"
+  text(1:length(unique(cntrl.group.labels)), par("usr")[4] - 
+         (par("usr")[4] - par("usr")[3]) * 0.05, label.string, 
+       col = cntrl.groupwise.group.colors, cex = 3)
+}
+dev.off()
+```
+
+**Function for data preparation**
+
+```{r, include=FALSE}
+prepare.data <- function(what="Cntrl", where="Data/pheno", group_labels = env$group.labels ){ #q redundant with PCA chunk, define earlier, use once
+  
+  ind <- grepl(pattern = what, group_labels)
+  ind <- which(ind)
+  mat <- spot.list$spotdata[, ind]
+  batch <- env$combat.batch[ind]
+  group.labels <- group_labels[ind]
+  names(batch) <- names(group.labels)
+  
+  pheno_vars <- load_pheno(where=where,batch)
+  age <- pheno_vars[[1]]
+  sex <- pheno_vars[[2]]
+  ph <- pheno_vars[[1]]
+  pmi <- pheno_vars[[1]]
+  
+  pmi[is.na(pmi)] <- mean(pmi, na.rm = T) #q these 2 lines were not put inside this function, added, remove if not needed
+  ph[is.na(ph)] <- mean(ph, na.rm = T)
+  
+  col.pal <- brewer.pal(length(unique(batch)), name = "Dark2")
+  delta <- min(batch)-1
+  cols <- col.pal[batch-delta]
+  
+  what.list = list(mat=mat,age=age, sex=sex, ph=ph, pmi=pmi)
+}
+```
+
+# **Prepare the Data for downstream analysis**
+
+```{r, include=FALSE}
+# prepare data for analysis
+cntrl.list <- prepare.data(what="Cntrl", where="Data/pheno")
+scz.list <- prepare.data(what="Scz", where="Data/pheno")
+bp.list <- prepare.data(what="BP", where="Data/pheno")
+mdd.list <- prepare.data(what="MDD", where="Data/pheno")
+
+ControlTimes <- cntrl.list$age
+ControlData <- cntrl.list$mat
+
+PerturbedTimes.scz <- scz.list$age
+PerturbedData.scz <- scz.list$mat
+
+PerturbedTimes.bp <- bp.list$age
+PerturbedData.bp <- bp.list$mat
+
+PerturbedTimes.mdd <- mdd.list$age
+PerturbedData.mdd <- mdd.list$mat
+
+o <- order(ControlTimes, decreasing = FALSE)
+ControlData <- ControlData[, o]
+ControlTimes <- ControlTimes[o]
+
+o1 <- order(PerturbedTimes.scz, decreasing = FALSE)
+PerturbedData.scz <- PerturbedData.scz[, o1]
+PerturbedTimes.scz <- PerturbedTimes.scz[o1]
+TestTimes.scz <- seq(min(c(min(ControlTimes), min(PerturbedTimes.scz))), max(c(max(ControlTimes), max(PerturbedTimes.scz))), length=100)
+
+o2 <- order(PerturbedTimes.bp, decreasing = FALSE)
+PerturbedData.bp <- PerturbedData.bp[, o2]
+PerturbedTimes.bp <- PerturbedTimes.bp[o2]
+TestTimes.bp <- seq(min(c(min(ControlTimes), min(PerturbedTimes.bp))), max(c(max(ControlTimes), max(PerturbedTimes.bp))), length=100)
+
+o3 <- order(PerturbedTimes.mdd, decreasing = FALSE)
+PerturbedData.mdd <- PerturbedData.mdd[, o3]
+PerturbedTimes.mdd <- PerturbedTimes.mdd[o3]
+TestTimes.mdd <- seq(min(c(min(ControlTimes), min(PerturbedTimes.mdd))), max(c(max(ControlTimes), max(PerturbedTimes.mdd))), length=100)
+```
+
+# **Linear regression pairwise age-disease comparisons**
+
+```{r}
+p.vals.lm <- vector(mode="numeric", length=nrow(ControlData))
+p.vals.mod <- vector(mode="numeric", length=nrow(ControlData))
+fit.list <- list()
+for(i in 1:length(p.vals.lm)){
+  fit <- lm(ControlData[i,]~ControlTimes)
+  p.vals.lm[i] <- summary(fit)$coefficients[2,4]
+  p.vals.mod[i] <- pf(summary(fit)$fstatistic[1],
+                      summary(fit)$fstatistic[2],
+                      summary(fit)$fstatistic[3],
+                      lower.tail = FALSE)
+  fit.list[[i]] <- fit
+}
+
+names(fit.list) <- rownames(ControlData)
+p.vals.lm.adj <- round(p.adjust(p.vals.lm, method = "bonferroni"), digits = 6)
+names(p.vals.lm.adj) <- rownames(ControlData)
+```
+
+```{r}
+# SCZ
+comp.data.scz <- cbind(ControlData, PerturbedData.scz)
+
+mod.scz <- data.frame(status=factor(c(rep("control", times=ncol(ControlData)), 
+                                      rep("scz", times=ncol(PerturbedData.scz))), 
+                                    levels = c("control", "scz") ), 
+                      age=c(ControlTimes, PerturbedTimes.scz))
+
+ind.1 <- mod.scz$age>=17 
+
+comp.data.scz <- comp.data.scz[, ind.1] 
+mod.scz <- mod.scz[ind.1, ]
+
+fit.list.scz <- list()
+p.vals.scz.lm <- vector(mode="numeric", length=nrow(comp.data.scz))
+names(p.vals.scz.lm) <- rownames(comp.data.scz)
+
+for(i in 1:nrow(comp.data.scz)) {
+  fit.scz <- lm(comp.data.scz[i,]~mod.scz$status+mod.scz$age)
+  p.vals.scz.lm[i] <- summary(fit.scz)$coefficients[2,4]
+  fit.list.scz[[i]] <- fit.scz
+}
+
+p.vals.scz.lm.adj <- round(p.adjust(p.vals.scz.lm, method = "bonferroni"), digits = 4)
+names(fit.list.scz) <- names(p.vals.scz.lm)
+```
+
+```{r}
+# BP
+
+comp.data.bp <- cbind(ControlData, PerturbedData.bp)
+
+mod.bp <- data.frame(status=factor(c(rep("control", times=ncol(ControlData)), 
+                                     rep("bp", times=ncol(PerturbedData.bp))), 
+                                   levels = c("control", "bp") ), 
+                     age=c(ControlTimes, PerturbedTimes.bp))
+
+ind.1 <- mod.bp$age>=17
+
+comp.data.bp <- comp.data.bp[, ind.1] 
+mod.bp <- mod.bp[ind.1, ]
+
+fit.list.bp <- list()
+p.vals.bp.lm <- vector(mode="numeric", length=nrow(comp.data.bp))
+names(p.vals.bp.lm) <- rownames(comp.data.bp)
+
+for(i in 1:nrow(comp.data.bp)) {
+  fit.bp <- lm(comp.data.bp[i,]~mod.bp$status+mod.bp$age)
+  p.vals.bp.lm[i] <- summary(fit.bp)$coefficients[2,4]
+  fit.list.bp[[i]] <- fit.bp
+}
+
+p.vals.bp.lm.adj <- round(p.adjust(p.vals.bp.lm, method = "bonferroni"), digits = 4)
+names(fit.list.bp) <- names(p.vals.bp.lm)
+```
+
+```{r}
+# MDD
+
+comp.data.mdd <- cbind(ControlData, PerturbedData.mdd)
+
+mod.mdd <- data.frame(status=factor(c(rep("control", times=ncol(ControlData)), 
+                                      rep("mdd", times=ncol(PerturbedData.mdd))), 
+                                    levels = c("control", "mdd") ), 
+                      age=c(ControlTimes, PerturbedTimes.mdd))
+
+ind.1 <- mod.mdd$age>=17
+
+comp.data.mdd <- comp.data.mdd[, ind.1] 
+mod.mdd <- mod.mdd[ind.1, ]
+
+fit.list.mdd <- list()
+p.vals.mdd.lm <- vector(mode="numeric", length=nrow(comp.data.mdd))
+names(p.vals.mdd.lm) <- rownames(comp.data.mdd)
+
+for(i in 1:nrow(comp.data.mdd)) {
+  fit.mdd <- lm(comp.data.mdd[i,]~mod.mdd$status+mod.mdd$age)
+  p.vals.mdd.lm[i] <- summary(fit.mdd)$coefficients[2,4]
+  fit.list.mdd[[i]] <- fit.mdd
+}
+
+p.vals.mdd.lm.adj <- round(p.adjust(p.vals.mdd.lm, method = "bonferroni"), digits = 4)
+names(fit.list.mdd) <- names(p.vals.mdd.lm)
+
+lm.spots <- list(SCZ=names(p.vals.scz.lm.adj)[p.vals.scz.lm.adj<=0.05], 
+                 BP=names(p.vals.bp.lm.adj)[p.vals.bp.lm.adj<=0.05],
+                 MDD=names(p.vals.mdd.lm.adj)[p.vals.mdd.lm.adj<=0.05])
+
+
+venn::venn(lm.spots, zcolor = "style")
+```
+
+# **Gaussian process regression**
+
+<https://cran.r-project.org/web/packages/GauPro/vignettes/GauPro.html>
+
+<https://www.r-bloggers.com/2012/04/gaussian-process-regression-with-r/>
+
+<https://mc-stan.org/docs/2_19/stan-users-guide/gaussian-process-regression.html>
+
+<https://bioinformatics-training.github.io/intro-machine-learning-2017/logistic-regression.html#gaussian-process-regression>
+
+### **DE_time differential perturbation**
+
+DEtime is an R package for two-sample time series analysis using Gaussian process methods. This package implements the Gaussian regression framework for perturbation time point inferrence in a two sample case. The paper describing this package is available at DOI: <https://doi.org/10.1093/bioinformatics/btw329> and arXiv: <http://arxiv.org/abs/1602.01743>.
+
+```{r echo=FALSE}
+# In case package archive installation fails
+
+# r.files <- dir("Tools/gptk/R/", full.names = T)
+# sapply(r.files, source)
+# 
+# r.files.1 <- dir("Tools/DEtime/R/", full.names = T)
+# sapply(r.files.1, source) 
+```
+
+```{r echo=FALSE}
+# SCZ
+res_rank.scz <- DEtime_rank(ControlTimes, ControlData, PerturbedTimes.scz, PerturbedData.scz, gene_ID = rownames(ControlData))
+res.scz <- DEtime_infer(ControlTimes = ControlTimes, ControlData = ControlData, PerturbedTimes = PerturbedTimes.scz, PerturbedData = PerturbedData.scz, TestTimes = TestTimes.scz, gene_ID = rownames(ControlData))
+
+res.df.scz <- data.frame(round(res_rank.scz$Loglikelihood_ratio, digits = 2), 
+                         as.numeric(res.scz$result$MAP), 
+                         as.numeric(res.scz$result$mean), 
+                         as.numeric(res.scz$result$median), 
+                         as.numeric(res.scz$result$ptl5), 
+                         as.numeric(res.scz$result$ptl95) )
+
+colnames(res.df.scz) <- c("log-likelihood ratio", "MAP", "mean", "median", "ptl9", "ptl95")
+rownames(res.df.scz) <- res_rank.scz$gene_ID
+res.df.scz <- res.df.scz[res.df.scz$`log-likelihood ratio` >= 1, ] 
+# Plotting GPR
+# plot_DEtime(res.scz)
+## END SCZ
+```
+
+```{r echo=FALSE}
+# BP
+res_rank.bp <- DEtime_rank(ControlTimes, ControlData, PerturbedTimes.bp, PerturbedData.bp, gene_ID = rownames(ControlData))
+res.bp <- DEtime_infer(ControlTimes = ControlTimes, ControlData = ControlData, PerturbedTimes = PerturbedTimes.bp, PerturbedData = PerturbedData.bp, TestTimes = TestTimes.bp, gene_ID = rownames(ControlData))
+
+res.df.bp <- data.frame(round(res_rank.bp$Loglikelihood_ratio, digits = 2), 
+                        as.numeric(res.bp$result$MAP), 
+                        as.numeric(res.bp$result$mean), 
+                        as.numeric(res.bp$result$median), 
+                        as.numeric(res.bp$result$ptl5), 
+                        as.numeric(res.bp$result$ptl95) )
+
+colnames(res.df.bp) <- c("log-likelihood ratio", "MAP", "mean", "median", "ptl9", "ptl95")
+rownames(res.df.bp) <- res_rank.bp$gene_ID
+res.df.bp <- res.df.bp[res.df.bp$`log-likelihood ratio` >= 1, ] 
+# Plotting GPR
+# plot_DEtime(res.bp)
+## END BP
+```
+
+```{r echo=FALSE}
+# MDD
+res_rank.mdd <- DEtime_rank(ControlTimes, ControlData, PerturbedTimes.mdd, PerturbedData.mdd, gene_ID = rownames(ControlData))
+res.mdd <- DEtime_infer(ControlTimes = ControlTimes, ControlData = ControlData, PerturbedTimes = PerturbedTimes.mdd, PerturbedData = PerturbedData.mdd, TestTimes = TestTimes.mdd, gene_ID = rownames(ControlData))
+
+ind <- res_rank.mdd$Loglikelihood_ratio > 1
+res.df.mdd <- data.frame(round(res_rank.mdd$Loglikelihood_ratio, digits = 2), 
+                         as.numeric(res.mdd$result$MAP), 
+                         as.numeric(res.mdd$result$mean), 
+                         as.numeric(res.mdd$result$median), 
+                         as.numeric(res.mdd$result$ptl5), 
+                         as.numeric(res.mdd$result$ptl95) )
+
+colnames(res.df.mdd) <- c("log-likelihood ratio", "MAP", "mean", "median", "ptl9", "ptl95")
+rownames(res.df.mdd) <- res_rank.mdd$gene_ID
+res.df.mdd <- res.df.mdd[res.df.mdd$`log-likelihood ratio` >= 1, ] 
+
+# Plotting GPR
+# plot_DEtime(res.mdd)
+## END MDD
+```
+
+```{r echo=FALSE}
+DE.spots <- list(SCZ=rownames(res.df.scz), 
+                 BP=rownames(res.df.bp),
+                 MDD=rownames(res.df.mdd) )
+
+venn::venn(DE.spots, zcolor = "style")
+
+early.DE.spots <- list(SCZ=rownames(res.df.scz)[res.df.scz$MAP<8],
+                       BP=rownames(res.df.bp)[res.df.bp$MAP<8],
+                       MDD=rownames(res.df.mdd)[res.df.mdd$MAP<8])
+
+
+venn::venn(early.DE.spots, zcolor = "style")
+
+pub.DE.spots <- list(SCZ=rownames(res.df.scz)[res.df.scz$MAP>8 & res.df.scz$MAP<20],
+                       BP=rownames(res.df.bp)[res.df.bp$MAP>8 & res.df.bp$MAP<20],
+                       MDD=rownames(res.df.mdd)[res.df.mdd$MAP>8 & res.df.mdd$MAP<20])
+
+venn::venn(pub.DE.spots, zcolor = "style")
+
+adol.DE.spots <- list(SCZ=rownames(res.df.scz)[res.df.scz$MAP>20 & res.df.scz$MAP<50],
+                       BP=rownames(res.df.bp)[res.df.bp$MAP>20 & res.df.bp$MAP<50],
+                       MDD=rownames(res.df.mdd)[res.df.mdd$MAP>20 & res.df.mdd$MAP<50])
+
+venn::venn(adol.DE.spots, zcolor = "style")
+
+late.DE.spots <- list(SCZ=rownames(res.df.scz)[res.df.scz$MAP>50],
+                       BP=rownames(res.df.bp)[res.df.bp$MAP>50],
+                       MDD=rownames(res.df.mdd)[res.df.mdd$MAP>50])
+
+venn::venn(late.DE.spots, zcolor = "style")
+```
+
+
+
+# **QTL enrichment analysis**
+
+```{r echo=FALSE}
+load("Data/BM.table.Rdata") # gene data annotation table
+
+gtex.files <- dir("Data/GTEX_unzipped", full.names = TRUE) 
+gtex.files <- gtex.files[-c(21, 22)]
+gtex.files.names <- sapply(gtex.files, function(x) strsplit(x = x,split = "/", fixed = T)[[1]][3])
+gtex.files.names <- sapply(gtex.files.names, function(x) 
+  strsplit(x = x,split = ".", fixed = T)[[1]][1])
+names(gtex.files.names) <- NULL
+
+spot.names <- rownames(ControlData)
+
+qtl.spot.list <- list()
+p.list <- vector(mode = "list", length = length(spot.names))
+names(p.list) <- spot.names
+
+for(spot in spot.names){
+  spot.probes <- spot.list$spots[[spot]]$genes
+  
+  spot.genes <- unique(BM.table$hgnc_symbol[BM.table$affy_hg_u133_plus_2 %in% spot.probes])
+  spot.genes <- spot.genes[spot.genes!=""]
+  
+  p <- vector(mode = "numeric", length = length(gtex.files))
+  qtl.gene.list <- list()
+  
+  for(i in 1:length(gtex.files)) {
+    qtl <- read.table(gtex.files[i], sep = "\t", header = TRUE, row.names = 1)
+    
+    # qtl genes
+    qtl.genes <- unique(qtl$gene_name[qtl$qval <= 0.05])
+    qtl.genes.backgroud <- unique(env$gene.info$names[env$gene.info$names %in% qtl.genes])
+    
+    # non qtl genes
+    nonqtl.genes.backgroud <- setdiff(unique(BM.table$hgnc_symbol),qtl.genes.backgroud)
+    nonqtl.genes.backgroud <- nonqtl.genes.backgroud[nonqtl.genes.backgroud!=""]
+    
+    qtl.spot.genes <- intersect(spot.genes, qtl.genes.backgroud)
+    nonqtl.spot.genes <- setdiff(spot.genes, qtl.spot.genes)
+    
+    qtl.mat <- matrix(c(length(qtl.spot.genes), length(nonqtl.spot.genes),
+                        length(qtl.genes.backgroud)-length(qtl.spot.genes),
+                        length(nonqtl.genes.backgroud)-length(nonqtl.spot.genes)),
+                      2,2)
+   
+    p[i] <- fisher.test(qtl.mat, alternative = "greater")$p.value
+    
+    qtl.gene.list[[i]] <- qtl.spot.genes
+    
+  }
+  
+  p.adj <- round(p.adjust(p, method = "bonferroni"), digits = 4)
+  names(p) <- names(p.adj) <- names(qtl.gene.list) <- gtex.files.names
+  p.list[[spot]] <- list(p = p, p.adj = p.adj)
+  qtl.spot.list[[spot]] <- qtl.gene.list
+  
+}
+
+tissues.all <- sapply(p.list, function(x) names(x$p.adj)[x$p.adj<=0.05])
+tissue.counts <- sapply(tissues.all, function(x) length(x) )
+tissues.all <- tissues.all[tissue.counts!=0]
+
+scz.spots <- DE.spots$SCZ
+bp.spots <- DE.spots$BP
+mdd.spots <- DE.spots$MDD
+
+scz.qtl.genes <- unique(unlist(qtl.spot.list[names(qtl.spot.list) %in% scz.spots]))
+bp.qtl.genes <- unique(unlist(qtl.spot.list[names(qtl.spot.list) %in% bp.spots]))
+mdd.qtl.genes <- unique(unlist(qtl.spot.list[names(qtl.spot.list) %in% mdd.spots]))
+
+setEnrichrSite("Enrichr")
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+
+query.dbs <- dbs$libraryName[c(159, 144, 155)] #dbs - DisGENET, GWAS catalog, UK Biobank GWAS
+
+if (websiteLive) {
+  enriched.scz <- enrichr(scz.qtl.genes, query.dbs)
+  enriched.bp <- enrichr(bp.qtl.genes, query.dbs)
+  enriched.mdd <- enrichr(mdd.qtl.genes, query.dbs)
+}
+
+yy.scz <- lapply(enriched.scz, function(x) {
+  ind <- grep("schizophre", x$Term, ignore.case = TRUE)
+  y <- x[ind, ]
+  y <- y[y$Adjusted.P.value < 0.1, ]
+  return(y)
+})
+
+ind <- sapply(yy.scz, function(x) nrow(x) )>0
+
+yy.scz <- yy.scz[ind]
+
+yy.scz.df <- do.call(rbind, yy.scz)
+
+yy.bp <- lapply(enriched.bp, function(x) {
+  ind <- grep("bipolar", x$Term, ignore.case = TRUE)
+  y <- x[ind, ]
+  y <- y[y$Adjusted.P.value < 0.1, ]
+  return(y)
+})
+
+ind <- sapply(yy.bp, function(x) nrow(x) )>0
+
+yy.bp <- yy.bp[ind]
+
+yy.bp.df <- do.call(rbind, yy.bp)
+
+yy.mdd <- lapply(enriched.mdd, function(x) {
+  ind <- grep("depres", x$Term, ignore.case = TRUE)
+  y <- x[ind, ]
+  y <- y[y$Adjusted.P.value < 0.1, ]
+  return(y)
+})
+
+ind <- sapply(yy.mdd, function(x) nrow(x) )>0
+
+yy.mdd <- yy.mdd[ind]
+
+yy.mdd.df <- do.call(rbind, yy.mdd)
+
+dis.geneetic.association.df <- rbind(yy.scz.df, yy.bp.df, yy.mdd.df)
+write.csv(dis.geneetic.association.df, file="dis.geneetic.association.df.csv")
+
+tissues <- tissues.all[names(tissues.all) %in% unique(c(scz.spots, bp.spots, mdd.spots))]
+
+blood <- unlist(lapply(tissues, function(x) {sum(grepl(pattern = "blood", x = x, 
+                                                       ignore.case = T))}))
+brain <- unlist(lapply(tissues, function(x) {sum(grepl(pattern = "cortex", x = x, 
+                                                       ignore.case = T))}))
+
+
+```
+
+-   Sankeyplot spot-QTL relation
+
+```{r, echo=FALSE}
+nodes <- c(sort(unique(unlist(tissues))), names(tissues))
+nodes.rank <- seq(0,length(nodes), by=1)
+names(nodes.rank) <- nodes
+links <- NULL
+for(i in 1:length(tissues)) {
+  tmp <- tissues[[i]]
+  if(length(tmp)==0)
+    next
+  for(j in 1:length(tmp)){
+    if(j != 0){
+      spot.tmp <- names(tissues)[i]
+      tissue.tmp <- tmp[j]
+      genes.tmp <- length(qtl.spot.list[[spot.tmp]][[tissue.tmp]])
+      links <- rbind(links, c(nodes.rank[tissue.tmp], nodes.rank[spot.tmp], genes.tmp))
+    }
+  }
+}
+colnames(links) = c("source", "target", "value")
+links <- data.frame(links)
+nodes.df <- data.frame(name = c(sort(unique(unlist(tissues))), names(tissues)))
+
+p = sankeyNetwork(Links = links, Nodes = nodes.df,
+                  Source = "source", Target = "target",
+                  Value = "value", NodeID = "name",
+                  fontSize = 12, nodeWidth = 20)
+```
+
